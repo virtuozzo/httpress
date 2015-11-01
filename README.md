@@ -4,6 +4,8 @@ High performance HTTP server stress & benchmark utility.
 
 Inspired by [weighttp](http://redmine.lighttpd.net/projects/weighttp/wiki) tool.
 
+Originally written by [yarosla at Bitbucket](https://bitbucket.org/yarosla/httpress/wiki/Home) and modified by Parallels Performance Team.
+
 ## Main features:
 
 * event driven (low memory footprint, large number of connections)
