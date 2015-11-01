@@ -7,7 +7,7 @@ BASE_NAME=httpress
 # Library dependencies:
 #  - libev 4 (http://software.schmorp.de/pkg/libev.html)
 
-LIBS=-lev -lpthread -lgnutls
+LIBS=-lrt -lev -lpthread -lgnutls -lhttp_parser -lparserutils -luchardet
 
 CFLAGS_RELEASE=-pthread -Wno-strict-aliasing -O2 -s -DWITH_SSL
 CFLAGS_DEBUG=-pthread -Wno-strict-aliasing -g -DWITH_SSL
