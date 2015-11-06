@@ -510,7 +510,7 @@ void nxweb_dbg(int level, connection *conn, const char *fmt, ...)
 atomic_t percentile[P_RANGE+1];
 
 /* register a request time in storage for percentile calculation */
-static void reg_percentile_val(double val, atomic_t* p)
+void reg_percentile_val(double val, atomic_t* p)
 {
 	double range = P_RANGE;
 	double step = P_UPPER_BOUND / range;
@@ -520,8 +520,9 @@ static void reg_percentile_val(double val, atomic_t* p)
 		idx = P_RANGE;
 	atomic_inc(&p[idx]);
 }
-/* returns a total number of requests registered in precentile */
-static atomic_val_t get_num_registered(atomic_t* p)
+
+/* returns a total number of requests registered in perecentile */
+atomic_val_t get_num_registered(atomic_t* p)
 {
 	atomic_val_t num = 0;
 	int i = 0;
@@ -531,7 +532,7 @@ static atomic_val_t get_num_registered(atomic_t* p)
 }
 
 /* returns percentile value in seconds */
-static double get_percentile(int x, atomic_t* p) // p - %
+double get_percentile(int x, atomic_t* p) // p - %
 {
 	atomic_val_t val_num = get_num_registered(p);
 	double th = val_num * (100 - x) / 100.0;
@@ -548,19 +549,19 @@ static double get_percentile(int x, atomic_t* p) // p - %
 	return idx * P_UPPER_BOUND / (double) P_RANGE;
 }
 
-static void clear_percentile(atomic_t* p)
+void clear_percentile(atomic_t* p)
 {
 	int i = 0;
 	for (i = 0; i <= P_RANGE; i++)
 		atomic_set(&p[i], 0);
 }
 
-static void reg_summary_percentile_val(double val)
+void reg_summary_percentile_val(double val)
 {
 	reg_percentile_val(val, percentile);
 }
 
-static double get_summary_percentile(int x)
+double get_summary_percentile(int x)
 {
 	if (!(x > 0 && x < 100))
 		nxweb_die("Percentile value should be between 1 and 99");
@@ -570,45 +571,24 @@ static double get_summary_percentile(int x)
 
 /* percentile calculation stuff for intermediate reports */
 atomic_t tmp_percentile[P_RANGE+1];
-atomic_t lk_tmp_percentile;
 
-static void lock_tmp_percentile()
+void reg_tmp_percentile_val(double val)
 {
-	__sync_or_and_fetch(&lk_tmp_percentile.val, 1);
-}
-
-static void unlock_tmp_percentile()
-{
-	__sync_and_and_fetch(&lk_tmp_percentile.val, 0);
-}
-
-static atomic_val_t is_locked_tmp_percentile()
-{
-	return atomic_get(&lk_tmp_percentile);
-}
-
-static void reg_tmp_percentile_val(double val)
-{
-	if(is_locked_tmp_percentile())
-		return;
-
 	reg_percentile_val(val, tmp_percentile);
 }
 
-static void clear_tmp_percentile()
+void clear_tmp_percentile()
 {
 	clear_percentile(tmp_percentile);
 }
 
-static double get_tmp_percentile(int x) // p - %
+double get_tmp_percentile(int x) // x - %
 {
 	if (!(x > 0 && x < 100))
 		nxweb_die("Percentile value should be between 1 and 99");
 
-	lock_tmp_percentile();
 	double res = get_percentile(x, tmp_percentile);
 	clear_tmp_percentile();
-	unlock_tmp_percentile();
 	return res;
 }
 
