@@ -510,7 +510,7 @@ void nxweb_dbg(int level, connection *conn, const char *fmt, ...)
 atomic_t percentile[P_RANGE+1];
 
 /* register a request time in storage for percentile calculation */
-static void reg_percentile_val(double val)
+static void reg_percentile_val(double val, atomic_t* p)
 {
 	double range = P_RANGE;
 	double step = P_UPPER_BOUND / range;
@@ -518,38 +518,98 @@ static void reg_percentile_val(double val)
 
 	if (idx > P_RANGE)
 		idx = P_RANGE;
-	atomic_inc(&percentile[idx]);
+	atomic_inc(&p[idx]);
 }
-
 /* returns a total number of requests registered in precentile */
-static atomic_val_t get_num_registered()
+static atomic_val_t get_num_registered(atomic_t* p)
 {
 	atomic_val_t num = 0;
-
-	for (int i = 0; i <= P_RANGE; i++)
-		num += atomic_get(&percentile[i]);
+	int i = 0;
+	for (i = 0; i <= P_RANGE; i++)
+		num += atomic_get(&p[i]);
 	return num;
 }
 
 /* returns percentile value in seconds */
-static double get_percentile(int p) // p - %
+static double get_percentile(int x, atomic_t* p) // p - %
 {
-	if (!(p > 0 && p < 100))
-		nxweb_die("Percentile value should be between 1 and 99");
-
-	atomic_val_t val_num = get_num_registered();
-	double th = val_num * (100 - p) / 100.0;
+	atomic_val_t val_num = get_num_registered(p);
+	double th = val_num * (100 - x) / 100.0;
 	atomic_val_t threshold = (atomic_val_t) (th - (atomic_val_t) th >= 0.5) ? th + 1 : th;
 
 	int idx = P_RANGE;
 	while(idx > 0) {
-		threshold -= atomic_get(&percentile[idx]);
+		threshold -= atomic_get(&p[idx]);
 		if (threshold <= 0)
 			break;
 		idx--;
 	}
 
 	return idx * P_UPPER_BOUND / (double) P_RANGE;
+}
+
+static void clear_percentile(atomic_t* p)
+{
+	int i = 0;
+	for (i = 0; i <= P_RANGE; i++)
+		atomic_set(&p[i], 0);
+}
+
+static void reg_summary_percentile_val(double val)
+{
+	reg_percentile_val(val, percentile);
+}
+
+static double get_summary_percentile(int x)
+{
+	if (!(x > 0 && x < 100))
+		nxweb_die("Percentile value should be between 1 and 99");
+
+	return get_percentile(x, percentile);
+}
+
+/* percentile calculation stuff for intermediate reports */
+atomic_t tmp_percentile[P_RANGE+1];
+atomic_t lk_tmp_percentile;
+
+static void lock_tmp_percentile()
+{
+	__sync_or_and_fetch(&lk_tmp_percentile.val, 1);
+}
+
+static void unlock_tmp_percentile()
+{
+	__sync_and_and_fetch(&lk_tmp_percentile.val, 0);
+}
+
+static atomic_val_t is_locked_tmp_percentile()
+{
+	return atomic_get(&lk_tmp_percentile);
+}
+
+static void reg_tmp_percentile_val(double val)
+{
+	if(is_locked_tmp_percentile())
+		return;
+
+	reg_percentile_val(val, tmp_percentile);
+}
+
+static void clear_tmp_percentile()
+{
+	clear_percentile(tmp_percentile);
+}
+
+static double get_tmp_percentile(int x) // p - %
+{
+	if (!(x > 0 && x < 100))
+		nxweb_die("Percentile value should be between 1 and 99");
+
+	lock_tmp_percentile();
+	double res = get_percentile(x, tmp_percentile);
+	clear_tmp_percentile();
+	unlock_tmp_percentile();
+	return res;
 }
 
 /****************************************************************************************
@@ -567,7 +627,8 @@ static void http_response_first_byte(connection *conn)
 		conn->bytes_to_read, conn->keep_alive ? ", KA" : "");
 
 	conn->tstamp_response_first_byte = conn->last_activity;
-	reg_percentile_val(conn->tstamp_response_first_byte - conn->tstamp_request_sent);
+	reg_summary_percentile_val(conn->tstamp_response_first_byte - conn->tstamp_request_sent);
+	reg_tmp_percentile_val(conn->tstamp_response_first_byte - conn->tstamp_request_sent);
 }
 
 /* Called when last byte of response received */
@@ -1526,7 +1587,8 @@ static void __write_cb(struct ev_loop *loop, ev_io *w, int revents)
 		};
 		const size_t n_buffers = sizeof(buffers) / sizeof(buffers[0]);
 		size_t total_size = 0;
-		for (int i = 0; i < n_buffers; i++) {
+		int i = 0;
+		for (i = 0; i < n_buffers; i++) {
 			total_size += buffers[i].size;
 		}
 
@@ -1543,7 +1605,8 @@ static void __write_cb(struct ev_loop *loop, ev_io *w, int revents)
 			size_t buf_size = 0;
 
 			size_t buffer_start = 0;
-			for (int i = 0; i < n_buffers; i++) {
+			int i = 0;
+			for (i = 0; i < n_buffers; i++) {
 				size_t offset = conn->write_pos - buffer_start;
 				if (offset < buffers[i].size) {
 					buf = buffers[i].buffer + offset;
@@ -2081,8 +2144,9 @@ static inline void inter_timer_expired_handler(int sig, siginfo_t *si, void *uc)
 	struct thread_config *t;
 	atomic_val_t this_success = 0, this_fail = 0, total_success = 0, total_fail = 0;
 	ev_tstamp now = ev_time();
+	int i = 0;
 
-	for (int i = 0; i < common_config.num_threads; i++) {
+	for (i = 0; i < common_config.num_threads; i++) {
 		atomic_val_t success, fail;
 		t = d->tdata[i];
 
@@ -2098,8 +2162,10 @@ static inline void inter_timer_expired_handler(int sig, siginfo_t *si, void *uc)
 		total_fail += fail;
 	}
 
-	fprintf(stdout, "total-loops: %llu; total-failed: %llu; loops: %llu; failed: %llu; time: %.1f; rate: { %.1f } req/sec;\n",
-			total_success + total_fail, total_fail, this_success + this_fail, this_fail, now - d->last_ts,
+
+	double prc = get_tmp_percentile(common_config.percentile) * 1000;	// from sec to msec
+	fprintf(stdout, "total-loops: %llu; total-failed: %llu; max-latency: %.2f; loops: %llu; failed: %llu; time: %.1f; rate: { %.1f } req/sec;\n",
+			total_success + total_fail, total_fail, prc, this_success + this_fail, this_fail, now - d->last_ts,
 			(double)this_success / (now - d->last_ts));
 	fflush(stdout);
 	d->last_ts = now;
@@ -2112,8 +2178,8 @@ static void calc_total(struct thread_config **threads, struct req_stats *total)
 	thread_config* tdata;
 
 	memset(total, 0, sizeof(struct req_stats));
-
-	for (int i = 0; i < common_config.num_threads; i++) {
+	int i = 0;
+	for (i = 0; i < common_config.num_threads; i++) {
 		tdata = threads[i];
 
 		ADD(num_success);
@@ -2220,8 +2286,10 @@ int main(int argc, char* argv[])
 	common_config.sleep_time = 0.0;
 	body_parser.enabled = 0;
 	common_config.percentile = 95;
+	lock_tmp_percentile();
 
-	for (int idx = 0; idx < MAX_DOMAINS_NUMBER; ++idx) {
+	int idx = 0;
+	for (idx = 0; idx < MAX_DOMAINS_NUMBER; ++idx) {
 		config[idx].uri_path = 0;
 		config[idx].uri_host = 0;
 	}
@@ -2239,7 +2307,8 @@ int main(int argc, char* argv[])
 	stat_codes.codes[4].begin = 500;
 	stat_codes.codes[4].end   = 511;
 
-	for (int i = 0; i < CLASS_NUM; i++) {
+	int i = 0;
+	for (i = 0; i < CLASS_NUM; i++) {
 		stat_codes.codes[i].counter =
 			calloc(stat_codes.codes[i].end - stat_codes.codes[i].begin + 1, sizeof(atomic_t));
 		if (!stat_codes.codes[i].counter)
@@ -2254,6 +2323,7 @@ int main(int argc, char* argv[])
 	const char *payload = "";
 	timer_t inter_timer;
 	struct sigevent sev;
+
 	while ((c = getopt(argc, argv, ":hVksql:m:n:p:c:z:r:d:t:i:x:e:R:P:I:")) != -1) {
 		switch (c) {
 			case 'h':
@@ -2342,6 +2412,7 @@ int main(int argc, char* argv[])
 				break;
 			case 'I':
 				inter_res = atoi(optarg);
+				unlock_tmp_percentile();
 				break;
 			case '?':
 				fprintf(stderr, "unkown option: -%c\n\n", optopt);
@@ -2425,7 +2496,7 @@ int main(int argc, char* argv[])
 		common_config.progress_step = 50000;
 
 	if (!common_config.range) {
-		for (int i = optind, idx = 0; i < argc; ++i, ++idx)
+		for (i = optind, idx = 0; i < argc; ++i, ++idx)
 			if (parse_uri(argv[i], idx))
 				nxweb_die("can't parse url: %s", argv[i]);
 	} else {
@@ -2433,7 +2504,8 @@ int main(int argc, char* argv[])
 		static char url_buf2[1024];
 		int config_idx = 0;
 
-		for (int url_idx = 0; url_idx < url_number; url_idx++) {
+		int url_idx = 0;
+		for (url_idx = 0; url_idx < url_number; url_idx++) {
 			memset(url_buf1, 0, sizeof(url_buf1));
 			memset(url_buf2, 0, sizeof(url_buf2));
 			char* current_url = argv[optind + url_idx];
@@ -2454,7 +2526,8 @@ int main(int argc, char* argv[])
 			}
 			strncpy(url_buf2, from2, to2 - from2);
 			url_buf2[to2 - from2] = '\0';
-			for (int i = common_config.range_start; i <= common_config.range_end; ++i) {
+
+			for (i = common_config.range_start; i <= common_config.range_end; ++i) {
 				char url_construct_buf[sizeof(url_buf1) +
 						sizeof(url_buf2) + 10];
 				snprintf(url_construct_buf, sizeof(url_construct_buf),
@@ -2470,7 +2543,7 @@ int main(int argc, char* argv[])
 	}
 
 #ifdef WITH_SSL
-	for (int idx = 0; idx < common_config.tot_domains_number; ++idx) {
+	for (idx = 0; idx < common_config.tot_domains_number; ++idx) {
 		if (config[idx].secure) {
 			if (!common_config.secure) {
 				if (common_config.num_threads > 1)
@@ -2517,7 +2590,7 @@ int main(int argc, char* argv[])
 		ainf.ai_next = NULL;
 		ainf.ai_addr = NULL;
 
-		for (int idx = 0; idx < common_config.tot_domains_number; ++idx) {
+		for (idx = 0; idx < common_config.tot_domains_number; ++idx) {
 			prt = strchr(config[idx].uri_host, ':');
 			if (prt)
 				port = atoi(++prt);
@@ -2540,14 +2613,14 @@ int main(int argc, char* argv[])
 		}
 	}
 	else {
-		for (int idx = 0; idx < common_config.tot_domains_number; ++idx)
+		for (idx = 0; idx < common_config.tot_domains_number; ++idx)
 			if (resolve_host(&config[idx].saddr, config[idx].uri_host, idx)) {
 				nxweb_log_error(NULL, "can't resolve host %s", config[idx].uri_host);
 				exit(EXIT_FAILURE);
 			}
 	}
 
-	for (int idx = 0; idx < common_config.tot_domains_number; ++idx) {
+	for (idx = 0; idx < common_config.tot_domains_number; ++idx) {
 		switch (method) {
 		case GET:
 			make_GET_request(&config[idx]);
@@ -2598,7 +2671,7 @@ int main(int argc, char* argv[])
 	}
 
 	ev_tstamp start_ts = ev_time();
-	int i, j;
+	int j;
 	int conns_allocated = 0;
 	thread_config* tdata;
 	int cur_domain_idx = 0;
@@ -2696,13 +2769,13 @@ int main(int argc, char* argv[])
 	if (!common_config.include_non2xx)
 		failed += atomic_get(&total.num_success) - atomic_get(&total.num_2xx);
 
-	double prc = get_percentile(common_config.percentile) * 1000;	// from sec to msec
+	double prc = get_summary_percentile(common_config.percentile) * 1000;	// from sec to msec
 
 	/* print results in perf-atomic format */
 	printf("loops: %lld; failed: %lld; time: %.1f; percentile(%d%%): %.1f ms; rate: { %.1f } req/sec;\n",
 		loops, failed, duration, common_config.percentile, prc, duration ? (loops - failed) / duration : 0.0);
 
-	for (int idx = 0; idx < common_config.tot_domains_number; ++idx)
+	for (idx = 0; idx < common_config.tot_domains_number; ++idx)
 		freeaddrinfo(config[idx].saddr);
 
 	for (i = 0; i < common_config.num_threads; i++) {
@@ -2720,7 +2793,7 @@ int main(int argc, char* argv[])
 
 #ifdef WITH_SSL
 	if (common_config.secure) {
-		for (int idx = 0; idx < common_config.tot_domains_number; ++idx) {
+		for (idx = 0; idx < common_config.tot_domains_number; ++idx) {
 			gnutls_certificate_free_credentials(config[idx].ssl_cred);
 			gnutls_priority_deinit(config[idx].priority_cache);
 		}
