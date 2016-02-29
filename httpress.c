@@ -368,6 +368,7 @@ typedef struct connection {
 	char* body_ptr;
 
 	enum connection_state state;
+	ev_tstamp start_time;
 } connection;
 
 typedef struct thread_config {
@@ -672,11 +673,13 @@ static void resume_write_cb(struct ev_loop *loop, ev_timer *w, int revents);
 static void resume_write(connection* conn)
 {
 	if(common_config.sleep_time) {
+		struct req_stats* stats = &conn->stats;
+		int request_num = atomic_get(&stats->num_success) + atomic_get(&stats->num_fail);
+		double sched_time = (request_num + 1) * common_config.sleep_time;
 		ev_tstamp now_ts = ev_time();
-		double shed_time = (conn->tdata->request_counter + 1) * common_config.sleep_time;
-		double sleep_time = shed_time - (now_ts - conn->tdata->start_time);
+		double sleep_time = sched_time - (now_ts - conn->start_time);
 
-		if (sleep > 0) {
+		if (sleep_time > 0) {
 			// start writing in sleep seconds
 			ev_timer_init(&conn->watch_resume_write, resume_write_cb, sleep_time, 0);
 			ev_timer_start(conn->tdata->loop, &conn->watch_resume_write);
@@ -2254,6 +2257,7 @@ int main(int argc, char* argv[])
 	const char *payload = "";
 	timer_t inter_timer;
 	struct sigevent sev;
+	double start_period = 0.0;
 	while ((c = getopt(argc, argv, ":hVksql:m:n:p:c:z:r:d:t:i:x:e:R:P:I:")) != -1) {
 		switch (c) {
 			case 'h':
@@ -2332,7 +2336,7 @@ int main(int argc, char* argv[])
 				int max_req_freq = atoi(optarg);
 				if (max_req_freq <= 0)
 					nxweb_die("-R option value (request frequency) must be > 0");
-				common_config.sleep_time = 1.0 / max_req_freq * (double) common_config.num_threads;
+				start_period = 1.0 / (double) max_req_freq;
 				printf("max %d req/sec\n", max_req_freq);
 				break;
 			case 'P':
@@ -2602,6 +2606,7 @@ int main(int argc, char* argv[])
 	int conns_allocated = 0;
 	thread_config* tdata;
 	int cur_domain_idx = 0;
+	common_config.sleep_time = start_period * (double) common_config.num_connections;
 	for (i = 0; i < common_config.num_threads; i++) {
 		threads[i] = tdata = memalign(MEM_GUARD, sizeof(thread_config) + MEM_GUARD);
 		if (!tdata)
@@ -2626,6 +2631,7 @@ int main(int argc, char* argv[])
 			conn->idx = cur_domain_idx % common_config.tot_domains_number;
 			conn->socket_id = cur_domain_idx;
 			conn->secure = config[conn->idx].secure;
+			conn->start_time = start_ts + (start_period * cur_domain_idx);
 			ev_io_init(&conn->watch_write, write_cb, -1, EV_WRITE);
 			ev_io_init(&conn->watch_read, read_cb, -1, EV_READ);
 			open_socket(conn);
