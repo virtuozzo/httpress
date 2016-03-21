@@ -2333,11 +2333,11 @@ int main(int argc, char* argv[])
 				break;
 			case 'R':
 				printf("Restricted request frequency mode: ");
-				int max_req_freq = atoi(optarg);
+				double max_req_freq = atof(optarg);
 				if (max_req_freq <= 0)
 					nxweb_die("-R option value (request frequency) must be > 0");
-				start_period = 1.0 / (double) max_req_freq;
-				printf("max %d req/sec\n", max_req_freq);
+				start_period = 1.0 / max_req_freq;
+				printf("max %.2f req/sec\n", max_req_freq);
 				break;
 			case 'P':
 				common_config.percentile = atoi(optarg);
@@ -2705,7 +2705,7 @@ int main(int argc, char* argv[])
 	double prc = get_percentile(common_config.percentile) * 1000;	// from sec to msec
 
 	/* print results in perf-atomic format */
-	printf("loops: %lld; failed: %lld; time: %.1f; percentile(%d%%): %.1f ms; rate: { %.1f } req/sec;\n",
+	printf("loops: %lld; failed: %lld; time: %.1f; percentile(%d%%): %.1f ms; rate: { %.2f } req/sec;\n",
 		loops, failed, duration, common_config.percentile, prc, duration ? (loops - failed) / duration : 0.0);
 
 	for (int idx = 0; idx < common_config.tot_domains_number; ++idx)
